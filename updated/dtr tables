@@ -1,0 +1,13 @@
+Table: dtr_days
+Columns:
+id int(11) AI PK 
+dtr_id int(11) 
+day int(11) 
+am_arrival varchar(10) 
+am_departure varchar(10) 
+pm_arrival varchar(10) 
+pm_departure varchar(10) 
+undertime_hours int(11) 
+undertime_minutes int(11) 
+is_compliant tinyint(1) 
+details text
