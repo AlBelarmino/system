@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from pdf2image import convert_from_bytes
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from PIL import Image
 import mysql.connector
@@ -616,17 +616,72 @@ async def ocr(
             connection.close()
 
 #computation of salary
+def clamp_time(actual_str, expected_str, direction="in"):
+    actual = datetime.strptime(actual_str, "%H:%M").time()
+    expected = datetime.strptime(expected_str, "%H:%M").time()
+    return max(actual, expected) if direction == "in" else min(actual, expected)
+
+def minutes_between(t1, t2):
+    return (datetime.combine(datetime.today(), t2) - datetime.combine(datetime.today(), t1)).seconds / 60
+
+def compute_daily_hours(entry):
+    try:
+        am_minutes, pm_minutes = 0, 0
+
+        if entry["am_arrival"] and entry["am_departure"]:
+            am_arrival = clamp_time(entry["am_arrival"], "08:00", "in")
+            am_departure = clamp_time(entry["am_departure"], "12:00", "out")
+            am_minutes = max(minutes_between(am_arrival, am_departure), 0)
+
+        if entry["pm_arrival"] and entry["pm_departure"]:
+            pm_arrival = clamp_time(entry["pm_arrival"], "13:00", "in")
+            pm_departure = clamp_time(entry["pm_departure"], "17:00", "out")
+            pm_minutes = max(minutes_between(pm_arrival, pm_departure), 0)
+
+        undertime = (entry.get("undertime_hours", 0) * 60) + entry.get("undertime_minutes", 0)
+        return max((am_minutes + pm_minutes - undertime) / 60, 0)
+    except:
+        return 0
+
+# 2025 DEDUCTION FORMULAS
+
+def calculate_sss_contribution(gross):
+    msc = min(max(gross, 3250), 30000)
+    return round(msc * 0.045, 2)
+
+def calculate_pagibig_contribution(gross):
+    return round(min(gross * 0.02, 100), 2)
+
+def calculate_philhealth_contribution(gross):
+    salary = min(max(gross, 10000), 100000)
+    return round(salary * 0.025, 2)
+
+def calculate_income_tax(gross, sss, philhealth, pagibig):
+    taxable_income = gross - (sss + philhealth + pagibig)
+
+    if taxable_income <= 20833:
+        return 0
+    elif taxable_income <= 33332:
+        return round((taxable_income - 20833) * 0.15, 2)
+    elif taxable_income <= 66666:
+        return round(1875 + (taxable_income - 33332) * 0.20, 2)
+    elif taxable_income <= 166666:
+        return round(8541.80 + (taxable_income - 66666) * 0.25, 2)
+    elif taxable_income <= 666666:
+        return round(33541.80 + (taxable_income - 166666) * 0.30, 2)
+    else:
+        return round(183541.80 + (taxable_income - 666666) * 0.35, 2)
+
+
 @app.post("/compute_salary")
 def compute_salary(data: dict = Body(...)):
     username = data.get("username")
-    month = data.get("month")
+    month_str = data.get("month")
 
-    if not username or not month:
+    if not username or not month_str:
         raise HTTPException(status_code=400, detail="Username and month are required")
 
     try:
-        print("📦 Received request to compute salary for:", username, "| Month:", month)
-
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
@@ -636,83 +691,101 @@ def compute_salary(data: dict = Body(...)):
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         user_id = user["id"]
-        print("✅ User ID found:", user_id)
 
         # Get DTR
         cursor.execute("""
             SELECT * FROM dtrs 
             WHERE user_id = %s AND (month = %s OR month LIKE CONCAT(%s, '%%'))
-        """, (user_id, month, month.split(',')[0].strip()))
-        dtr_results = cursor.fetchall()
-        if not dtr_results:
-            raise HTTPException(status_code=404, detail=f"No DTR found for {month}")
-        dtr = dtr_results[0]
-        print("✅ DTR found:", dtr["id"])
+        """, (user_id, month_str, month_str.split(',')[0].strip()))
+        dtr = cursor.fetchone()
+        if not dtr:
+            raise HTTPException(status_code=404, detail=f"No DTR found for {month_str}")
+
+        dtr_month = dtr["month"]
+        dtr_year = dtr["year"]
+        try:
+            month_index = list(calendar.month_name).index(dtr_month.strip().split()[0])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid month format in DTR")
+
+        _, num_days = calendar.monthrange(dtr_year, month_index)
+        working_days = sum(1 for day in range(1, num_days + 1)
+                           if datetime(dtr_year, month_index, day).weekday() < 5)
 
         # Get daily entries
         cursor.execute("SELECT * FROM dtr_days WHERE dtr_id = %s", (dtr["id"],))
         day_entries = cursor.fetchall()
-        print(f"📅 Found {len(day_entries)} day entries")
-
-        # Helper to compute daily hours
-        def compute_daily_hours(entry):
-            try:
-                def to_minutes(t):
-                    return datetime.strptime(t, "%H:%M").hour * 60 + datetime.strptime(t, "%H:%M").minute
-
-                am = to_minutes(entry["am_departure"]) - to_minutes(entry["am_arrival"])
-                pm = to_minutes(entry["pm_departure"]) - to_minutes(entry["pm_arrival"])
-                undertime = (entry.get("undertime_hours", 0) * 60) + entry.get("undertime_minutes", 0)
-                total_minutes = am + pm - undertime
-                return max(total_minutes / 60, 0)
-            except Exception as e:
-                print(f"⚠️ Failed to compute daily hours for day {entry.get('day')}: {e}")
-                return 0
 
         total_hours = sum(compute_daily_hours(e) for e in day_entries)
-        print("⏱️ Total hours computed:", total_hours)
-
-        # Calculate working_days, days_present, days_absent, leave_used
-        working_days = len(day_entries)  # assuming dtr_days covers only official working days
         days_present = sum(1 for e in day_entries if e.get("am_arrival") and e.get("pm_arrival"))
-        leave_used = sum(1 for e in day_entries if e.get("is_leave") == 1)
-        days_absent = working_days - days_present - leave_used
-        if days_absent < 0:
-            days_absent = 0  # safety check
-
-        print(f"Working days: {working_days}, Days Present: {days_present}, Leave Used: {leave_used}, Days Absent: {days_absent}")
 
         # Get payroll profile
         cursor.execute("""
-            SELECT base_salary_hour, sss_deduction, pagibig_deduction,
-                   philhealth_deduction, tax_deduction
+            SELECT base_salary_hour, employment_type, leave_credits
             FROM employee_profiles WHERE user_id = %s
         """, (user_id,))
         profile = cursor.fetchone()
         if not profile:
             raise HTTPException(status_code=404, detail="Payroll profile not found")
 
-        print("💰 Payroll profile found:", profile)
-
         rate = float(profile["base_salary_hour"])
-        gross = total_hours * rate
-        deductions_list = [
-            float(profile["sss_deduction"]),
-            float(profile["pagibig_deduction"]),
-            float(profile["philhealth_deduction"]),
-            float(profile["tax_deduction"])
-        ]
-        total_deductions = sum(deductions_list)
+        employment_type = profile["employment_type"]
+        leave_credits = float(profile["leave_credits"])
+
+        # REGULAR vs IRREGULAR logic
+        if employment_type == "irregular":
+            gross = total_hours * rate
+            expected_gross = gross
+            days_absent = 0
+            leave_used = 0
+        else:
+            expected_monthly_hours = working_days * 8
+            expected_gross = expected_monthly_hours * rate
+
+            days_absent = working_days - days_present
+            if days_absent < 0:
+                days_absent = 0
+
+            if leave_credits >= days_absent:
+                leave_used = days_absent
+                days_absent = 0
+                new_leave_credits = leave_credits - leave_used
+            else:
+                leave_used = int(leave_credits)
+                days_absent -= leave_used
+                new_leave_credits = 0
+
+            # Update leave credits
+            cursor.execute("UPDATE employee_profiles SET leave_credits = %s WHERE user_id = %s",
+                           (new_leave_credits, user_id))
+            connection.commit()
+
+            gross = total_hours * rate
+
+        # Compute deductions using expected_gross
+        sss = calculate_sss_contribution(expected_gross)
+        pagibig = calculate_pagibig_contribution(expected_gross)
+        philhealth = calculate_philhealth_contribution(expected_gross)
+        tax = calculate_income_tax(gross, sss, philhealth, pagibig)
+
+        total_deductions = round(sss + pagibig + philhealth + tax, 2)
         net = gross - total_deductions
 
-        print("📄 Final Payslip Computed: Gross:", gross, "| Net:", net)
-
-        # Insert payslip record
+        # Insert payslip
         insert_query = """
             INSERT INTO payslips (
-                user_id, dtr_id, month, year, working_days, days_present, days_absent, leave_used,
-                gross_income, total_deductions, net_income, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                user_id, dtr_id, month, year,
+                working_days, days_present, days_absent, leave_used,
+                total_hours, gross_income,
+                sss_deduction, philhealth_deduction, pagibig_deduction, tax_deduction,
+                total_deductions, net_income,
+                created_at
+            ) VALUES (%s, %s, %s, %s,
+                      %s, %s, %s, %s,
+                      %s, %s,
+                      %s, %s, %s, %s,
+                      %s, %s,
+                      NOW())
         """
         cursor.execute(insert_query, (
             user_id,
@@ -723,17 +796,19 @@ def compute_salary(data: dict = Body(...)):
             days_present,
             days_absent,
             leave_used,
+            round(total_hours, 2),
             round(gross, 2),
-            round(total_deductions, 2),
+            sss,
+            philhealth,
+            pagibig,
+            tax,
+            total_deductions,
             round(net, 2)
         ))
         connection.commit()
-        print("✅ Payslip saved to DB")
 
-        # Update DTR status
         cursor.execute("UPDATE dtrs SET status = 'processed', processed_at = NOW() WHERE id = %s", (dtr["id"],))
         connection.commit()
-        print("✅ DTR marked as processed")
 
         return {
             "fullName": dtr["employee_name"],
@@ -741,22 +816,30 @@ def compute_salary(data: dict = Body(...)):
             "ratePerHour": rate,
             "totalHours": round(total_hours, 2),
             "grossIncome": round(gross, 2),
-            "totalDeductions": round(total_deductions, 2),
+            "deductions": {
+                "sss": sss,
+                "pagibig": pagibig,
+                "philhealth": philhealth,
+                "incomeTax": tax
+            },
+            "totalDeductions": total_deductions,
             "netPay": round(net, 2),
             "workingDays": working_days,
             "daysPresent": days_present,
             "daysAbsent": days_absent,
             "leaveUsed": leave_used,
-            "status": "processed"
+            "status": "processed",
+            "employmentType": employment_type
         }
 
     except Exception as e:
-        print("❌ Error during salary computation:", str(e))
         raise HTTPException(status_code=500, detail=f"Computation failed: {str(e)}")
     finally:
         if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
+
+
 
 
 #fetching payslips
@@ -799,117 +882,84 @@ def parse_db_month_to_iso(month: str, year: int) -> str:
 
 @app.get("/payslip")
 async def get_payslip(username: str, month: str, year: int):
-    print(f"🔍 Fetching payslip for {username}, month: {month}, year: {year}")
+    print(f"🔍 Fetching payslip for {username}, input month: {month}, input year: {year}")
     
     try:
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
-        # Get user ID
-        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        # 🔎 Get user ID
+        cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
-        
+
         if not user:
-            print("❌ User not found")
             raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user["id"]
+        full_name = user["full_name"]
+        print(f"✅ Found user ID: {user_id}, Name: {full_name}")
 
-        user_id = user['id']
-        print(f"✅ User ID: {user_id}")
+        # 🗓 Normalize month format
+        normalized_month, normalized_year = format_month_for_db(month)
+        if normalized_year == 0:
+            normalized_year = year  # fallback to passed year if parsing fails
 
-        # Convert input month to database format
-        month_name, year_value = format_month_for_db(month)
-        print(f"🔄 Converted {month} to DB format: month='{month_name}', year={year_value}")
+        print(f"📅 Normalized month: {normalized_month}, year: {normalized_year}")
 
-        # Use the provided year parameter if we got 0 from formatting
-        if year_value == 0:
-            year_value = year
-
-        # Fetch the most recent payslip (month + year match)
-            query = """
-                SELECT p.*, u.full_name
-                FROM payslips p
-                JOIN users u ON p.user_id = u.id
-                WHERE p.user_id = %s AND TRIM(p.month) = %s AND p.year = %s
-                ORDER BY p.created_at DESC
-                LIMIT 1
-            """
-        print(f"📝 Executing query with params: user_id={user_id}, month='{month_name}', year={year_value}")
-        cursor.execute(query, (user_id, month_name, year_value))
+        # 📄 Fetch payslip from DB
+        cursor.execute("""
+            SELECT *
+            FROM payslips
+            WHERE user_id = %s AND TRIM(month) = %s AND year = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (user_id, normalized_month, normalized_year))
         
         payslip = cursor.fetchone()
-        print(f"📄 Payslip data: {payslip}")
-
         if not payslip:
-            print("⚠️ No payslip found, checking available months")
-            cursor.execute("""
-                SELECT DISTINCT TRIM(month) as month, year
-                FROM payslips 
-                WHERE user_id = %s
-                ORDER BY year, STR_TO_DATE(CONCAT('01 ', month, ' ', year), '%d %M %Y')
-            """, (user_id,))
-            available_months = [{"month": row['month'], "year": row['year']} for row in cursor.fetchall()]
-            print(f"📅 Available months: {available_months}")
-            
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": f"No payslip found for {month_name} {year_value}",
-                    "available_months": available_months
-                }
-            )
+            raise HTTPException(status_code=404, detail=f"No payslip found for {normalized_month} {normalized_year}")
 
-        # Get detailed deductions
+        # 💰 Get base rate from employee_profiles
         cursor.execute("""
-            SELECT 
-                sss_deduction as sss,
-                pagibig_deduction as pagibig,
-                philhealth_deduction as philhealth,
-                tax_deduction as tax
+            SELECT base_salary_hour
             FROM employee_profiles
             WHERE user_id = %s
         """, (user_id,))
-        
-        deductions = cursor.fetchone() or {}
-        print(f"💰 Deductions: {deductions}")
+        profile = cursor.fetchone()
 
-        # Calculate hours and rate
-        days_present = payslip['days_present'] or 0
-        gross_income = float(payslip['gross_income']) if payslip['gross_income'] else 0
-        
-        if days_present > 0:
-            total_hours = round(gross_income / (days_present * 8), 2)
-            rate_per_hour = round(gross_income / (days_present * 8), 2)
-        else:
-            total_hours = 0
-            rate_per_hour = 0
+        base_rate = float(profile.get("base_salary_hour", 0)) if profile else 0
 
-        # Prepare response with properly formatted period
-        iso_month = parse_db_month_to_iso(payslip['month'], payslip['year'])
+        # ✅ Use deductions stored in payslip
+        deductions = [
+            {"label": "SSS", "amount": float(payslip.get("sss_deduction", 0))},
+            {"label": "Pag-IBIG", "amount": float(payslip.get("pagibig_deduction", 0))},
+            {"label": "PhilHealth", "amount": float(payslip.get("philhealth_deduction", 0))},
+            {"label": "Tax", "amount": float(payslip.get("tax_deduction", 0))}
+        ]
+
+        total_hours = float(payslip.get("total_hours", 0))
+        days_present = payslip.get("days_present", 0)
+
         response = {
-            "fullName": payslip['full_name'],
-            "period": iso_month,
+            "fullName": full_name,
+            "period": parse_db_month_to_iso(normalized_month, normalized_year),
             "totalHours": total_hours,
-            "ratePerHour": rate_per_hour,
-            "grossIncome": gross_income,
-            "deductions": [
-                {"label": "SSS", "amount": float(deductions.get('sss', 0))},
-                {"label": "Pag-IBIG", "amount": float(deductions.get('pagibig', 0))},
-                {"label": "PhilHealth", "amount": float(deductions.get('philhealth', 0))},
-                {"label": "Tax", "amount": float(deductions.get('tax', 0))}
-            ],
-            "netPay": float(payslip['net_income']) if payslip['net_income'] else 0,
+            "ratePerHour": base_rate,
+            "grossIncome": float(payslip.get("gross_income", 0)),
+            "deductions": deductions,
+            "netPay": float(payslip.get("net_income", 0)),
             "status": "processed",
-            "workingDays": payslip['working_days'],
-            "daysPresent": payslip['days_present'],
-            "daysAbsent": payslip['days_absent'],
-            "leaveUsed": payslip['leave_used']
+            "workingDays": payslip.get("working_days", 0),
+            "daysPresent": days_present,
+            "daysAbsent": payslip.get("days_absent", 0),
+            "leaveUsed": payslip.get("leave_used", 0),
         }
 
-        print(f"📤 Response prepared: {response}")
+        print(f"📤 Final response: {response}")
         return response
 
     except mysql.connector.Error as err:
-        print(f"❌ Database error: {err}")
+        print(f"❌ MySQL error: {err}")
         raise HTTPException(status_code=500, detail=f"Database error: {err}")
     except Exception as e:
         print(f"❌ Unexpected error: {str(e)}")
@@ -920,7 +970,7 @@ async def get_payslip(username: str, month: str, year: int):
             cursor.close()
         if 'connection' in locals():
             connection.close()
-    
+
 @app.get("/available-months")
 async def get_available_months(username: str):
     try:
