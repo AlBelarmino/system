@@ -11,3 +11,76 @@ undertime_hours int(11)
 undertime_minutes int(11) 
 is_compliant tinyint(1) 
 details text
+Foreign Key: dtr_days_ibfk_1
+Definition:
+Target dtrs (dtr_id → id) 
+On Update RESTRICT 
+On Delete CASCADE
+
+Table: users
+Columns:
+id int(11) AI PK 
+full_name varchar(200) 
+email varchar(100) 
+username varchar(50) 
+password_hash varchar(255) 
+role varchar(50) 
+created_at datetime
+
+Table: dtrs
+Columns:
+id int(11) AI PK 
+user_id int(11) 
+employee_name varchar(255) 
+month varchar(100) 
+year int(11) 
+working_hours varchar(100) 
+verified_by varchar(255) 
+position varchar(100) 
+total_time varchar(100) 
+uploaded_at datetime 
+status enum('pending','processed') 
+processed_at datetime
+Foreign Key: fk_dtrs_user
+Definition:
+Target users (user_id → id) 
+On Update RESTRICT 
+On Delete CASCADE
+
+
+Table: employee_loans
+Columns:
+id int(11) AI PK 
+user_id int(11) 
+loan_name varchar(100) 
+amount decimal(10,2) 
+duration_months int(11) 
+start_month year(4) 
+start_month_number tinyint(4) 
+created_at datetime
+Foreign Key: employee_loans_ibfk_1
+Definition:
+Target users (user_id → id) 
+On Update RESTRICT 
+On Delete CASCADE
+
+Table: employee_profiles
+Columns:
+id int(11) AI PK 
+user_id int(11) 
+employee_name varchar(100) 
+employment_type enum('regular','irregular') 
+salary_grade varchar(50) 
+base_salary_hour decimal(10,2) 
+gsis_deduction decimal(10,2) 
+created_at datetime 
+sss_deduction decimal(10,2) 
+pagibig_deduction decimal(10,2) 
+philhealth_deduction decimal(10,2) 
+tax_deduction decimal(10,2) 
+leave_credits float
+Foreign Key: employee_profiles_ibfk_1
+Definition:
+Target users (user_id → id) 
+On Update RESTRICT 
+On Delete CASCADE
