@@ -1,18 +1,21 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field  
 from pdf2image import convert_from_bytes
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from PIL import Image
+from decimal import Decimal
+from calendar import month_name
+from collections import defaultdict
+import calendar
 import mysql.connector
 import bcrypt
 import traceback
 import pytesseract
 import io
 import re
-import calendar
 import json
 
 # Tesseract path
@@ -79,6 +82,11 @@ class DTRDayEntry(BaseModel):
     undertime_hours: int
     undertime_minutes: int
 
+class SalaryRequest(BaseModel):
+    username: str
+    month_str: str  
+
+
 class DeductionItem(BaseModel):
     label: str
     amount: float
@@ -90,6 +98,24 @@ class PayslipResponse(BaseModel):
     ratePerHour: float
     grossIncome: float
     deductions: List[DeductionItem]
+
+class MonthEntry(BaseModel):
+    month: str
+    year: int
+
+class MonthSelection(BaseModel):
+    username: str
+    selected_months: List[MonthEntry]
+
+class RecordOut(BaseModel):
+    month: str
+    year: int
+    dtr_pdf_url: str
+    payslip_pdf_url: Optional[str]
+    payroll_report_pdf_url: Optional[str]
+
+    class Config:
+        orm_mode = True
 
 # Database initialization (run this once)
 def initialize_database():
@@ -275,6 +301,8 @@ def get_user_profile(username: str = Query(...)):
         cursor.execute("""
             SELECT 
                 IFNULL(employment_type, %s) AS employment_type,
+                IFNULL(salary_grade, %s) AS salaryGrade,
+                IFNULL(base_monthly_salary, %s) AS baseMonthlySalary,
                 IFNULL(base_salary_hour, %s) AS baseSalaryPerHour,
                 IFNULL(gsis_deduction, %s) AS gsisDeduction,
                 IFNULL(philhealth_deduction, %s) AS philhealthDeduction,
@@ -284,6 +312,8 @@ def get_user_profile(username: str = Query(...)):
             WHERE user_id = %s
         """, (
             payroll_defaults["employment_type"],
+            '12',  # default salaryGrade
+            0,     # default baseMonthlySalary
             payroll_defaults["baseSalaryPerHour"],
             payroll_defaults["gsisDeduction"],
             payroll_defaults["philhealthDeduction"],
@@ -310,19 +340,20 @@ def get_user_profile(username: str = Query(...)):
 
         # Get loans - ensure consistent structure
         cursor.execute("""
-            SELECT 
-                id,
-                IFNULL(loan_type, '') AS loan_type,
-                IFNULL(loan_name, '') AS loan_name,
-                IFNULL(amount, 0) AS amount,
-                IFNULL(start_month, '') AS start_month,
-                IFNULL(start_year, '') AS start_year,
-                IFNULL(duration_months, 0) AS duration_months,
-                DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at
-            FROM employee_loans
-            WHERE user_id = %s
-            ORDER BY created_at DESC
-        """, (user_id,))
+              SELECT 
+                    id,
+                    IFNULL(loan_type, '') AS loan_type,
+                    IFNULL(loan_name, '') AS loan_name,
+                    IFNULL(amount, 0) AS amount,
+                    IFNULL(start_month, '') AS start_month,
+                    IFNULL(start_year, '') AS start_year,
+                    IFNULL(duration_months, 0) AS duration_months,
+                    CAST(IFNULL(balance, 0) AS DECIMAL(10,2)) AS balance,
+                    DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS created_at
+                FROM employee_loans
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+            """, (user_id,))
         loans = cursor.fetchall()
 
         return {
@@ -377,6 +408,11 @@ def update_user_profile(data: dict = Body(...)):
         # Extract nested payrollProfile
         payroll = data.get("payrollProfile", {})
 
+        # Extract grade and salary values
+        salary_grade = payroll.get("salaryGrade")
+        base_monthly_salary = payroll.get("baseMonthlySalary")
+        base_salary_hour = payroll.get("baseSalaryPerHour", 0.0)
+
         # Check if payroll profile exists
         cursor.execute("""
             SELECT id FROM employee_profiles WHERE user_id = %s
@@ -384,17 +420,18 @@ def update_user_profile(data: dict = Body(...)):
         existing_profile = cursor.fetchone()
 
         if existing_profile:
-            # Update existing profile
             cursor.execute("""
                 UPDATE employee_profiles 
-                SET employment_type = %s, base_salary_hour = %s,
-                    gsis_deduction = %s,
-                    philhealth_deduction = %s, tax_deduction = %s,
-                    leave_credits = %s
+                SET employment_type = %s, salary_grade = %s,
+                    base_monthly_salary = %s, base_salary_hour = %s,
+                    gsis_deduction = %s, philhealth_deduction = %s, 
+                    tax_deduction = %s, leave_credits = %s
                 WHERE id = %s
             """, (
                 payroll.get("employment_type", "regular"),
-                payroll.get("baseSalaryPerHour", 0.0),
+                salary_grade,
+                base_monthly_salary,
+                base_salary_hour,
                 payroll.get("gsisDeduction", 0.0),
                 payroll.get("philhealthDeduction", 0.0),
                 payroll.get("taxDeduction", 0.0),
@@ -402,40 +439,38 @@ def update_user_profile(data: dict = Body(...)):
                 existing_profile[0]
             ))
         else:
-            # Insert new profile
             cursor.execute("""
                 INSERT INTO employee_profiles (
-                    user_id, employment_type, base_salary_hour, 
+                    user_id, employment_type, salary_grade, 
+                    base_monthly_salary, base_salary_hour, 
                     gsis_deduction, philhealth_deduction, 
                     tax_deduction, leave_credits
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id,
                 payroll.get("employment_type", "regular"),
-                payroll.get("baseSalaryPerHour", 0.0),
+                salary_grade,
+                base_monthly_salary,
+                base_salary_hour,
                 payroll.get("gsisDeduction", 0.0),
                 payroll.get("philhealthDeduction", 0.0),
                 payroll.get("taxDeduction", 0.0),
                 payroll.get("leaveCredits", 0.0)
             ))
 
-        # Update password if provided
+        # Password update
         if data.get("password"):
             hashed = bcrypt.hashpw(data["password"].encode('utf-8'), bcrypt.gensalt())
             cursor.execute("UPDATE users SET password_hash = %s WHERE username = %s", 
                            (hashed, data["username"]))
 
-        # Clear previous bonuses and loans
+        # Clear and insert bonuses
         cursor.execute("DELETE FROM employee_bonuses WHERE user_id = %s", (user_id,))
-        cursor.execute("DELETE FROM employee_loans WHERE user_id = %s", (user_id,))
-
-        # === Handle Bonuses ===
         bonuses = payroll.get("bonuses", [])
         bonus_other = payroll.get("bonusOther", {})
 
         for bonus in bonuses:
-            # Only insert if all required fields are present
             if bonus.get("name") and bonus.get("amount") is not None:
                 cursor.execute("""
                     INSERT INTO employee_bonuses 
@@ -461,45 +496,48 @@ def update_user_profile(data: dict = Body(...)):
                 bonus_other.get("frequency", "yearly")
             ))
 
-        # === Handle Loans ===
+        # Clear and insert loans
+        cursor.execute("DELETE FROM employee_loans WHERE user_id = %s", (user_id,))
         loans = payroll.get("loans", [])
         loan_other = payroll.get("loanOther", {})
 
         for loan in loans:
-            # Only insert if all required fields are present
             if loan.get("name") and loan.get("amount") is not None:
+                loan_amount = float(loan.get("amount", 0.0))
                 cursor.execute("""
                     INSERT INTO employee_loans (
                         user_id, loan_type, loan_name, amount, 
-                        start_month, start_year, duration_months
+                        start_month, start_year, duration_months, balance
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     user_id,
                     loan.get("type", ""),
                     loan.get("name", ""),
-                    float(loan.get("amount", 0.0)),
+                    loan_amount,
                     loan.get("startMonth", None),
                     loan.get("startYear", None),
-                    loan.get("durationMonths", 0)
+                    loan.get("durationMonths", 0),
+                    loan_amount  # 👈 this sets the initial balance = amount
                 ))
 
         if loan_other and loan_other.get("name"):
-            cursor.execute("""
-                INSERT INTO employee_loans (
-                    user_id, loan_type, loan_name, amount, 
-                    start_month, start_year, duration_months
-                )
-                VALUES (%s, 'other', %s, %s, %s, %s, %s)
-            """, (
-                user_id,
-                loan_other.get("name"),
-                float(loan_other.get("amount", 0.0)),
-                loan_other.get("startMonth", ""),
-                loan_other.get("startYear", ""),
-                loan_other.get("durationMonths", 0)
-            ))
-
+                loan_other_amount = float(loan_other.get("amount", 0.0))
+                cursor.execute("""
+                    INSERT INTO employee_loans (
+                        user_id, loan_type, loan_name, amount, 
+                        start_month, start_year, duration_months, balance
+                    )
+                    VALUES (%s, 'other', %s, %s, %s, %s, %s, %s)
+                """, (
+                    user_id,
+                    loan_other.get("name"),
+                    loan_other_amount,
+                    loan_other.get("startMonth", ""),
+                    loan_other.get("startYear", ""),
+                    loan_other.get("durationMonths", 0),
+                    loan_other_amount  # 👈 again, set balance = amount
+                ))
         connection.commit()
         return {"message": "Profile updated successfully"}
 
@@ -511,6 +549,7 @@ def update_user_profile(data: dict = Body(...)):
         if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
+
 
 # OCR Endpoint (Updated)
 @app.post("/ocr")
@@ -789,204 +828,269 @@ def compute_daily_hours(entry):
         return max((am_minutes + pm_minutes - undertime) / 60, 0)
     except:
         return 0
-
-# 2025 DEDUCTION FORMULAS
-
-def calculate_sss_contribution(gross):
-    msc = min(max(gross, 3250), 30000)
-    return round(msc * 0.045, 2)
-
-def calculate_pagibig_contribution(gross):
-    return round(min(gross * 0.02, 100), 2)
-
-def calculate_philhealth_contribution(gross):
-    salary = min(max(gross, 10000), 100000)
-    return round(salary * 0.025, 2)
-
-def calculate_income_tax(gross, sss, philhealth, pagibig):
-    taxable_income = gross - (sss + philhealth + pagibig)
-
-    if taxable_income <= 20833:
-        return 0
-    elif taxable_income <= 33332:
-        return round((taxable_income - 20833) * 0.15, 2)
-    elif taxable_income <= 66666:
-        return round(1875 + (taxable_income - 33332) * 0.20, 2)
-    elif taxable_income <= 166666:
-        return round(8541.80 + (taxable_income - 66666) * 0.25, 2)
-    elif taxable_income <= 666666:
-        return round(33541.80 + (taxable_income - 166666) * 0.30, 2)
-    else:
-        return round(183541.80 + (taxable_income - 666666) * 0.35, 2)
-
-
+    
 @app.post("/compute_salary")
-def compute_salary(data: dict = Body(...)):
-    username = data.get("username")
-    month_str = data.get("month")
-
-    if not username or not month_str:
-        raise HTTPException(status_code=400, detail="Username and month are required")
-
+async def compute_salary(payload: SalaryRequest):
     try:
+        print(f"⏩ Received payload: {payload.dict()}")
+        
+        username = payload.username
+        month_str = payload.month_str.strip().capitalize()
+
+        # Database connection
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
-
-        # Get user ID
+        
+        # 1. Get user ID
         cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         user_id = user["id"]
-
-        # Get DTR
+        
+        # 2. Get DTR
         cursor.execute("""
             SELECT * FROM dtrs 
-            WHERE user_id = %s AND (month = %s OR month LIKE CONCAT(%s, '%%'))
-        """, (user_id, month_str, month_str.split(',')[0].strip()))
+            WHERE user_id = %s 
+            AND month = %s
+            LIMIT 1
+        """, (user_id, month_str))
         dtr = cursor.fetchone()
         if not dtr:
             raise HTTPException(status_code=404, detail=f"No DTR found for {month_str}")
 
         dtr_month = dtr["month"]
         dtr_year = dtr["year"]
+
+        # 3. Calculate working days
         try:
-            month_index = list(calendar.month_name).index(dtr_month.strip().split()[0])
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid month format in DTR")
+            month_index = list(calendar.month_name).index(dtr_month)
+            _, num_days = calendar.monthrange(dtr_year, month_index)
+            working_days = sum(
+                1 for day in range(1, num_days + 1)
+                if datetime(dtr_year, month_index, day).weekday() < 5
+            )
+        except:
+            working_days = 22  # Fallback value
 
-        _, num_days = calendar.monthrange(dtr_year, month_index)
-        working_days = sum(1 for day in range(1, num_days + 1)
-                           if datetime(dtr_year, month_index, day).weekday() < 5)
-
-        # Get daily entries
+        # 4. Get daily entries and compute hours
         cursor.execute("SELECT * FROM dtr_days WHERE dtr_id = %s", (dtr["id"],))
         day_entries = cursor.fetchall()
+        
+        def compute_daily_hours(e):
+            try:
+                times = [
+                    datetime.strptime(e[period], "%H:%M") 
+                    for period in ['am_arrival', 'am_departure', 'pm_arrival', 'pm_departure']
+                    if e.get(period)
+                ]
+                if len(times) != 4:
+                    return 0.0
+                return (times[1] - times[0] + times[3] - times[2]).seconds / 3600
+            except:
+                return 0.0
 
         total_hours = sum(compute_daily_hours(e) for e in day_entries)
         days_present = sum(1 for e in day_entries if e.get("am_arrival") and e.get("pm_arrival"))
 
-        # Get payroll profile
+        # 5. Get payroll profile with proper error handling
         cursor.execute("""
-            SELECT base_salary_hour, employment_type, leave_credits
+            SELECT base_salary_hour, employment_type, leave_credits,
+                   gsis_deduction, philhealth_deduction, tax_deduction,
+                   base_monthly_salary
             FROM employee_profiles WHERE user_id = %s
         """, (user_id,))
         profile = cursor.fetchone()
         if not profile:
             raise HTTPException(status_code=404, detail="Payroll profile not found")
 
-        rate = float(profile["base_salary_hour"])
-        employment_type = profile["employment_type"]
-        leave_credits = float(profile["leave_credits"])
+                # Convert all values to float with error handling
+        try:
+                    rate = float(profile["base_salary_hour"])
+                    monthly_salary = float(profile["base_monthly_salary"])
+                    employment_type = profile["employment_type"]
+                    leave_credits = float(profile["leave_credits"] or 0)
+                    philhealth = float(profile["philhealth_deduction"] or 0)
+                    tax = float(profile["tax_deduction"] or 0)
+                    gsis = float(profile["gsis_deduction"] or 0)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=500, detail=f"Invalid payroll values: {str(e)}")
 
-        # REGULAR vs IRREGULAR logic
         if employment_type == "irregular":
             gross = total_hours * rate
-            expected_gross = gross
             days_absent = 0
             leave_used = 0
         else:
-            expected_monthly_hours = working_days * 8
-            expected_gross = expected_monthly_hours * rate
+            gross = monthly_salary
+            days_absent = max(working_days - days_present, 0)
+            leave_used = min(leave_credits, days_absent)
+            unpaid_absent_days = max(days_absent - leave_used, 0)
+            absent_deduction = round((monthly_salary / working_days) * unpaid_absent_days, 2)
+            gross = monthly_salary - absent_deduction
+            new_leave_credits = leave_credits - leave_used
+            cursor.execute(
+                "UPDATE employee_profiles SET leave_credits = %s WHERE user_id = %s",
+                (new_leave_credits, user_id)
+            )
 
-            days_absent = working_days - days_present
-            if days_absent < 0:
-                days_absent = 0
+        # 7. Process Loans - NOW AT CORRECT INDENTATION LEVEL
+        loan_deduction = 0.0
+        loans_to_save = []
 
-            if leave_credits >= days_absent:
-                leave_used = days_absent
-                days_absent = 0
-                new_leave_credits = leave_credits - leave_used
-            else:
-                leave_used = int(leave_credits)
-                days_absent -= leave_used
-                new_leave_credits = 0
+        try:
+            print("\n🔎 Checking loans for deduction...")
+            cursor.execute("""
+                SELECT id, loan_name, amount, duration_months, 
+                    start_month, start_year, balance
+                FROM employee_loans 
+                WHERE user_id = %s AND balance >= 0
+            """, (user_id,))
+            loans = cursor.fetchall()
+            
+            current_period = f"{dtr_month} {dtr_year}"
+            
+            for loan in loans:
+                try:
+                    # Handle month format (both "01" and "January")
+                    if loan['start_month'].isdigit():
+                        month_num = int(loan['start_month'])
+                        start_month = calendar.month_name[month_num]
+                    else:
+                        start_month = loan['start_month'].capitalize()
+                    
+                    loan_date = datetime.strptime(f"{start_month} {loan['start_year']}", "%B %Y")
+                    current_date = datetime.strptime(current_period, "%B %Y")
+                    
+                    if current_date >= loan_date:
+                        monthly_payment = round(float(loan['amount']) / loan['duration_months'], 2)
+                        if monthly_payment > float(loan['balance']):
+                            monthly_payment = float(loan['balance'])
+                        
+                        loan_deduction += monthly_payment
+                        new_balance = round(float(loan['balance']) - monthly_payment, 2)
+                        
+                        loans_to_save.append({
+                            'loan_name': loan['loan_name'],
+                            'amount': monthly_payment
+                        })
+                        
+                        cursor.execute(
+                            "UPDATE employee_loans SET balance = %s WHERE id = %s",
+                            (new_balance, loan['id'])
+                        )
+                except Exception as e:
+                    print(f"Error processing loan {loan.get('id')}: {str(e)}")
+                    continue
 
-            # Update leave credits
-            cursor.execute("UPDATE employee_profiles SET leave_credits = %s WHERE user_id = %s",
-                           (new_leave_credits, user_id))
-            connection.commit()
+        except Exception as e:
+            print(f"Loan processing failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Loan processing error: {str(e)}")
+                    
+        # 8. Process Bonuses - Updated to match your schema
+        bonuses = 0.0
+        bonuses_to_save = []
 
-            gross = total_hours * rate
+        cursor.execute("""
+            SELECT amount, frequency, bonus_type, bonus_name 
+            FROM employee_bonuses 
+            WHERE user_id = %s
+        """, (user_id,))
+        
+        bonuses_data = cursor.fetchall()
+        for b in bonuses_data:
+            try:
+                # Monthly bonuses always apply
+                if b["frequency"] == "monthly":
+                    bonuses += float(b["amount"])
+                    bonuses_to_save.append({
+                        'bonus_name': b["bonus_name"],  # Using bonus_name instead of bonus_type
+                        'amount': float(b["amount"])
+                    })
+                # Yearly bonuses only in December
+                elif b["frequency"] == "yearly" and dtr_month.lower() == "december":
+                    bonuses += float(b["amount"])
+                    bonuses_to_save.append({
+                        'bonus_name': b["bonus_name"],  # Using bonus_name instead of bonus_type
+                        'amount': float(b["amount"])
+                    })
+            except Exception as e:
+                print(f"⚠️ Error processing bonus: {str(e)}")
+                continue
 
-        # Compute deductions using expected_gross
-        sss = calculate_sss_contribution(expected_gross)
-        pagibig = calculate_pagibig_contribution(expected_gross)
-        philhealth = calculate_philhealth_contribution(expected_gross)
-        tax = calculate_income_tax(gross, sss, philhealth, pagibig)
 
-        total_deductions = round(sss + pagibig + philhealth + tax, 2)
-        net = gross - total_deductions
+        # 9. Final calculations
+        total_deductions = round(gsis + philhealth + tax + loan_deduction, 2)
+        net = round(gross + bonuses - total_deductions, 2)
 
-        # Insert payslip
-        insert_query = """
+        # 10. Save payslip
+        cursor.execute("""
             INSERT INTO payslips (
                 user_id, dtr_id, month, year,
                 working_days, days_present, days_absent, leave_used,
-                total_hours, gross_income,
-                sss_deduction, philhealth_deduction, pagibig_deduction, tax_deduction,
-                total_deductions, net_income,
-                created_at
-            ) VALUES (%s, %s, %s, %s,
-                      %s, %s, %s, %s,
-                      %s, %s,
-                      %s, %s, %s, %s,
-                      %s, %s,
-                      NOW())
-        """
-        cursor.execute(insert_query, (
-            user_id,
-            dtr["id"],
-            dtr["month"],
-            dtr["year"],
-            working_days,
-            days_present,
-            days_absent,
-            leave_used,
-            round(total_hours, 2),
-            round(gross, 2),
-            sss,
-            philhealth,
-            pagibig,
-            tax,
-            total_deductions,
-            round(net, 2)
+                total_hours, gross_income, bonuses,
+                philhealth_deduction, tax_deduction, loan_deduction,
+                total_deductions, net_income, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """, (
+            user_id, dtr["id"], dtr_month, dtr_year,
+            working_days, days_present, days_absent, leave_used,
+            round(total_hours, 2), round(gross, 2), round(bonuses, 2),
+            philhealth, tax, round(loan_deduction, 2),
+            total_deductions, net
         ))
-        connection.commit()
+        
+        payslip_id = cursor.lastrowid
 
-        cursor.execute("UPDATE dtrs SET status = 'processed', processed_at = NOW() WHERE id = %s", (dtr["id"],))
+        # 11. Save loan deductions to payslip_loan_deductions
+        for loan in loans_to_save:
+            cursor.execute("""
+                INSERT INTO payslip_loan_deductions 
+                (payslip_id, loan_name, amount)
+                VALUES (%s, %s, %s)
+            """, (payslip_id, loan['loan_name'], loan['amount']))
+
+        # 12. Save bonuses to payslip_bonuses
+        for bonus in bonuses_to_save:
+            cursor.execute("""
+                INSERT INTO payslip_bonuses 
+                (payslip_id, bonus_name, amount)
+                VALUES (%s, %s, %s)
+            """, (payslip_id, bonus['bonus_name'], bonus['amount']))
+
+        # 11. Update DTR status
+        cursor.execute("""
+            UPDATE dtrs SET status = 'processed', processed_at = NOW()
+            WHERE id = %s
+        """, (dtr["id"],))
+
         connection.commit()
 
         return {
-            "fullName": dtr["employee_name"],
-            "period": dtr["month"],
-            "ratePerHour": rate,
-            "totalHours": round(total_hours, 2),
-            "grossIncome": round(gross, 2),
-            "deductions": {
-                "sss": sss,
-                "pagibig": pagibig,
-                "philhealth": philhealth,
-                "incomeTax": tax
-            },
-            "totalDeductions": total_deductions,
-            "netPay": round(net, 2),
-            "workingDays": working_days,
-            "daysPresent": days_present,
-            "daysAbsent": days_absent,
-            "leaveUsed": leave_used,
-            "status": "processed",
-            "employmentType": employment_type
+            "status": "success",
+            "data": {
+                "employee": dtr["employee_name"],
+                "period": f"{dtr_month} {dtr_year}",
+                "grossIncome": round(gross, 2),
+                "deductions": {
+                    "philhealth": philhealth,
+                    "tax": tax,
+                    "loans": round(loan_deduction, 2),
+                    "total": total_deductions
+                },
+                "netPay": net
+            }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Computation failed: {str(e)}")
+        connection.rollback()
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if 'connection' in locals() and connection.is_connected():
+        if connection.is_connected():
             cursor.close()
             connection.close()
-
-
 
 
 #fetching payslips
@@ -1027,15 +1131,16 @@ def parse_db_month_to_iso(month: str, year: int) -> str:
     except ValueError:
         return f"{year}-01"  # Fallback to January if parsing fails
 
+
 @app.get("/payslip")
 async def get_payslip(username: str, month: str, year: int):
     print(f"🔍 Fetching payslip for {username}, input month: {month}, input year: {year}")
-    
+
     try:
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
-        # 🔎 Get user ID
+        # 🔎 Get user ID & full name
         cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
 
@@ -1046,58 +1151,89 @@ async def get_payslip(username: str, month: str, year: int):
         full_name = user["full_name"]
         print(f"✅ Found user ID: {user_id}, Name: {full_name}")
 
-        # 🗓 Normalize month format
-        normalized_month, normalized_year = format_month_for_db(month)
-        if normalized_year == 0:
-            normalized_year = year  # fallback to passed year if parsing fails
-
+        # 📅 Normalize month format
+        parsed_month, parsed_year = format_month_for_db(month)
+        normalized_month = parsed_month.strip().lower().capitalize() if parsed_month else month.strip().lower().capitalize()
+        normalized_year = parsed_year if parsed_year != 0 else year
         print(f"📅 Normalized month: {normalized_month}, year: {normalized_year}")
 
         # 📄 Fetch payslip from DB
         cursor.execute("""
             SELECT *
             FROM payslips
-            WHERE user_id = %s AND TRIM(month) = %s AND year = %s
+            WHERE user_id = %s AND LOWER(TRIM(month)) = %s AND year = %s
             ORDER BY created_at DESC
             LIMIT 1
-        """, (user_id, normalized_month, normalized_year))
-        
+        """, (user_id, normalized_month.lower(), normalized_year))
+
         payslip = cursor.fetchone()
         if not payslip:
             raise HTTPException(status_code=404, detail=f"No payslip found for {normalized_month} {normalized_year}")
+        
+        payslip_id = payslip["id"]
+        print(f"📄 Found payslip ID: {payslip_id}")
 
-        # 💰 Get base rate from employee_profiles
+        # 👔 Get employee profile
         cursor.execute("""
-            SELECT base_salary_hour
+            SELECT employment_type, base_salary_hour, base_monthly_salary
             FROM employee_profiles
             WHERE user_id = %s
         """, (user_id,))
         profile = cursor.fetchone()
 
-        base_rate = float(profile.get("base_salary_hour", 0)) if profile else 0
+        employment_type = profile.get("employment_type", "irregular") if profile else "irregular"
+        rate_per_hour = float(profile.get("base_salary_hour", 0)) if employment_type == "irregular" else None
+        rate_per_month = float(profile.get("base_monthly_salary", 0)) if employment_type == "regular" else None
 
-        # ✅ Use deductions stored in payslip
+        # 🎁 Get bonuses
+        cursor.execute("""
+            SELECT bonus_name, amount
+            FROM payslip_bonuses
+            WHERE payslip_id = %s
+        """, (payslip_id,))
+        bonuses = [{"label": b["bonus_name"], "amount": float(b["amount"])} for b in cursor.fetchall()]
+
+        # 💸 Get loan deductions
+        cursor.execute("""
+            SELECT 
+                pl.loan_name, 
+                pl.amount,
+                (SELECT balance FROM employee_loans 
+                WHERE user_id = %s AND loan_name = pl.loan_name
+                ORDER BY created_at DESC LIMIT 1) as balance
+            FROM payslip_loan_deductions pl
+            WHERE pl.payslip_id = %s
+        """, (user_id, payslip_id))
+        
+        loan_deductions = []
+        for l in cursor.fetchall():
+            loan_deductions.append({
+                "label": l["loan_name"],
+                "amount": float(l["amount"]),
+                "balance": float(l["balance"]) if l["balance"] is not None else 0.0
+            })
+
+        # 🧾 Government deductions
         deductions = [
-            {"label": "SSS", "amount": float(payslip.get("sss_deduction", 0))},
-            {"label": "Pag-IBIG", "amount": float(payslip.get("pagibig_deduction", 0))},
+            {"label": "GSIS", "amount": float(payslip.get("total_deductions", 0)) - float(payslip.get("loan_deduction", 0)) - float(payslip.get("tax_deduction", 0)) - float(payslip.get("philhealth_deduction", 0))},  # optional split
             {"label": "PhilHealth", "amount": float(payslip.get("philhealth_deduction", 0))},
-            {"label": "Tax", "amount": float(payslip.get("tax_deduction", 0))}
-        ]
-
-        total_hours = float(payslip.get("total_hours", 0))
-        days_present = payslip.get("days_present", 0)
+            {"label": "Tax", "amount": float(payslip.get("tax_deduction", 0))},
+        ] + loan_deductions
 
         response = {
             "fullName": full_name,
             "period": parse_db_month_to_iso(normalized_month, normalized_year),
-            "totalHours": total_hours,
-            "ratePerHour": base_rate,
+            "employmentType": employment_type,
+            "ratePerHour": rate_per_hour,
+            "ratePerMonth": rate_per_month,
+            "totalHours": float(payslip.get("total_hours", 0)),
             "grossIncome": float(payslip.get("gross_income", 0)),
+            "bonuses": bonuses,
             "deductions": deductions,
             "netPay": float(payslip.get("net_income", 0)),
             "status": "processed",
             "workingDays": payslip.get("working_days", 0),
-            "daysPresent": days_present,
+            "daysPresent": payslip.get("days_present", 0),
             "daysAbsent": payslip.get("days_absent", 0),
             "leaveUsed": payslip.get("leave_used", 0),
         }
@@ -1117,6 +1253,7 @@ async def get_payslip(username: str, month: str, year: int):
             cursor.close()
         if 'connection' in locals():
             connection.close()
+
 
 @app.get("/available-months")
 async def get_available_months(username: str):
@@ -1148,3 +1285,202 @@ async def get_available_months(username: str):
         if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
+
+@app.get("/payslip/latest")
+async def get_latest_payslip(username: str):
+    try:
+        connection = mysql.connector.connect(**db_config)
+        cursor = connection.cursor(dictionary=True)
+
+        # Make sure to fetch both id and full_name
+        cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_id = user["id"]
+
+        cursor.execute("""
+            SELECT * FROM payslips
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (user_id,))
+        payslip = cursor.fetchone()
+        if not payslip:
+            raise HTTPException(status_code=404, detail="No payslip found")
+
+        payslip_id = payslip["id"]
+
+        # Bonuses
+        cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
+        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
+
+        # Loans
+        cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
+        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
+
+        return {
+            "fullName": user["full_name"],
+            "period": f"{payslip['month']} {payslip['year']}",
+            "grossIncome": float(payslip["gross_income"]),
+            "netPay": float(payslip["net_income"]),
+            "bonuses": bonuses,
+            "deductions": loans
+        }
+
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if 'connection' in locals(): connection.close()
+
+@app.post("/api/payslip/summary")
+async def get_payslip_summary(data: MonthSelection):
+    try:
+        connection = mysql.connector.connect(**db_config)
+        cursor = connection.cursor(dictionary=True)
+
+        # Get user ID and employment info
+        cursor.execute("""
+            SELECT u.id, e.employment_type, e.base_salary_hour, e.base_monthly_salary, e.salary_grade, u.full_name
+            FROM users u
+            LEFT JOIN employee_profiles e ON u.id = e.user_id
+            WHERE u.username = %s
+        """, (data.username,))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_id = user["id"]
+        full_name = user["full_name"]
+
+        # Data containers
+        monthly_summary = {}
+        income_breakdown = defaultdict(lambda: defaultdict(float))
+        deduction_breakdown = defaultdict(lambda: defaultdict(float))
+        quarter_totals = defaultdict(float)
+        month_list = []
+
+        # Quarter label mapping
+        quarter_map = {
+            1: "Jan-Mar",
+            2: "Apr-Jun",
+            3: "Jul-Sep",
+            4: "Oct-Dec"
+        }
+
+        for entry in data.selected_months:
+            month = entry.month
+            year = entry.year
+
+            cursor.execute("""
+                SELECT *
+                FROM payslips
+                WHERE user_id = %s AND month = %s AND year = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (user_id, month, year))
+            payslip = cursor.fetchone()
+            if not payslip:
+                continue
+
+            payslip_id = payslip["id"]
+            month_key = f"{month} {year}"
+            month_list.append(month_key)
+
+            # Get quarter key for potential future use
+            try:
+                month_index = list(calendar.month_name).index(month.capitalize())
+                quarter = (month_index - 1) // 3 + 1
+                quarter_key = f"{quarter_map[quarter]} {year}"
+            except:
+                quarter_key = f"Q{month} {year}"
+
+            gross = float(payslip.get("gross_income", 0))
+            deductions = float(payslip.get("total_deductions", 0))
+            net = float(payslip.get("net_income", 0))
+
+            monthly_summary[month_key] = {
+                "gross_income": gross,
+                "total_deductions": deductions,
+                "net_income": net,
+                "quarter": quarter_key
+            }
+
+            quarter_totals[f"{quarter_key}_gross"] += gross
+            quarter_totals[f"{quarter_key}_deductions"] += deductions
+            quarter_totals[f"{quarter_key}_net"] += net
+
+            # Base salary
+            income_breakdown["Base Salary"][month_key] += gross
+
+            # Bonuses
+            cursor.execute("""
+                SELECT bonus_name, amount
+                FROM payslip_bonuses
+                WHERE payslip_id = %s
+            """, (payslip_id,))
+            for bonus in cursor.fetchall():
+                income_breakdown[bonus["bonus_name"]][month_key] += float(bonus["amount"])
+
+            # Loan deductions
+            cursor.execute("""
+                SELECT pl.loan_name, pl.amount,
+                       (SELECT balance FROM employee_loans 
+                        WHERE user_id = %s AND loan_name = pl.loan_name
+                        ORDER BY created_at DESC LIMIT 1) as balance
+                FROM payslip_loan_deductions pl
+                WHERE pl.payslip_id = %s
+            """, (user_id, payslip_id))
+            
+            for loan in cursor.fetchall():
+                deduction_breakdown[loan["loan_name"]][month_key] += float(loan["amount"])
+                deduction_breakdown[f"{loan['loan_name']}_balance"][month_key] = float(loan["balance"]) if loan["balance"] is not None else 0.0
+
+            # Gov deductions
+            gsis = float(payslip.get("total_deductions", 0)) - float(payslip.get("loan_deduction", 0)) - float(payslip.get("tax_deduction", 0)) - float(payslip.get("philhealth_deduction", 0))
+            philhealth = float(payslip.get("philhealth_deduction", 0))
+            tax = float(payslip.get("tax_deduction", 0))
+
+            deduction_breakdown["GSIS"][month_key] += gsis
+            deduction_breakdown["PhilHealth"][month_key] += philhealth
+            deduction_breakdown["Tax"][month_key] += tax
+
+        # Compute totals
+        total_gross = sum(month["gross_income"] for month in monthly_summary.values())
+        total_deductions = sum(month["total_deductions"] for month in monthly_summary.values())
+        total_net = sum(month["net_income"] for month in monthly_summary.values())
+
+        quarter_summary = {}
+        for quarter in set(m["quarter"] for m in monthly_summary.values()):
+            quarter_summary[quarter] = {
+                "gross_income": quarter_totals[f"{quarter}_gross"],
+                "total_deductions": quarter_totals[f"{quarter}_deductions"],
+                "net_income": quarter_totals[f"{quarter}_net"]
+            }
+
+        return {
+            "fullName": full_name,
+            "employmentType": user.get("employment_type", "regular"),
+            "salaryGrade": user.get("salary_grade", ""),
+            "monthlySummary": monthly_summary,
+            "quarterSummary": quarter_summary,  # still useful for charts
+            "incomeBreakdown": dict(income_breakdown),
+            "deductionBreakdown": dict(deduction_breakdown),
+            "totals": {
+                "gross_income": total_gross,
+                "total_deductions": total_deductions,
+                "net_income": total_net
+            },
+            "months": month_list
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        if 'connection' in locals() and connection.is_connected():
+            cursor.close()
+            connection.close()
+
