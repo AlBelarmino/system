@@ -1,39 +1,64 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
 import { Link } from 'react-router-dom';
 
 const Dashboard = () => {
-  const employee = {
-    id: '1004',
-    name: 'Jose Manalo',
-    position: 'Teacher',
-    period: 'April 2025',
-    earnings: [
-      { label: 'Basic Pay', amount: 2250 },
-      { label: 'Conveyance Allowance', amount: 750 },
-      { label: 'House Rent Allowance', amount: 1125 },
-    ],
-    deductions: [
-      { label: 'Income Tax', amount: 450 },
-      { label: 'Loan Repayment', amount: 160 },
-    ],
-  };
+  const [payslip, setPayslip] = useState(null);
+  const [userInfo, setUserInfo] = useState(null);
+  const username = localStorage.getItem('username');
 
-  const totalEarnings = employee.earnings.reduce((sum, e) => sum + e.amount, 0);
-  const totalDeductions = employee.deductions.reduce((sum, d) => sum + d.amount, 0);
-  const netPay = totalEarnings - totalDeductions;
+  // Fetch user info (e.g., full name, position)
+  useEffect(() => {
+    const fetchUserInfo = async () => {
+      try {
+        const res = await axios.get(`http://localhost:8000/payslip/latest`, {
+          params: { username }
+        });
+        setUserInfo(res.data);
+      } catch (error) {
+        console.error("Failed to fetch user info:", error);
+      }
+    };
+
+    fetchUserInfo();
+  }, [username]);
+
+  // Fetch latest payslip
+  useEffect(() => {
+    const fetchPayslip = async () => {
+      try {
+        const res = await axios.get(`http://localhost:8000/payslip/latest`, {
+          params: { username }
+        });
+        setPayslip(res.data);
+      } catch (error) {
+        console.error("Failed to fetch payslip:", error);
+      }
+    };
+
+    fetchPayslip();
+  }, [username]);
+
+  if (!userInfo || !payslip) {
+    return <div>Loading dashboard...</div>;
+  }
+
+  const totalEarnings = payslip.grossIncome;
+  const totalDeductions = payslip.deductions.reduce((sum, d) => sum + d.amount, 0);
+  const netPay = payslip.netPay;
 
   return (
     <div className="payslip-container">
       <div className="payslip-header">
-        <h1 className="payslip-title">Payslip</h1>
+        <h1 className="payslip-title">{payslip.fullName}</h1>
         <p className="employee-info">
-          {employee.name} | Position: {employee.position} | Period: {employee.period}
+          Period: {payslip.period}
         </p>
       </div>
 
       <div className="summary-grid">
         <div className="summary-card">
-          <div className="summary-label">Total Earnings</div>
+          <div className="summary-label">Gross Income</div>
           <div className="summary-value">₱{totalEarnings.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
         </div>
         <div className="summary-card">
@@ -46,25 +71,21 @@ const Dashboard = () => {
         </div>
       </div>
 
-      {/* Earnings Table */}
+      {/* Bonuses Table */}
       <table className="details-table">
         <thead>
           <tr>
-            <th>Earnings Breakdown</th>
+            <th>Income Breakdown</th>
             <th>Amount</th>
           </tr>
         </thead>
         <tbody>
-          {employee.earnings.map((e, i) => (
+          {payslip.bonuses.map((e, i) => (
             <tr key={i}>
               <td>{e.label}</td>
               <td>₱{e.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
             </tr>
           ))}
-          <tr className="total-row">
-            <td>Total Earnings</td>
-            <td>₱{totalEarnings.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-          </tr>
         </tbody>
       </table>
 
@@ -77,16 +98,12 @@ const Dashboard = () => {
           </tr>
         </thead>
         <tbody>
-          {employee.deductions.map((d, i) => (
+          {payslip.deductions.map((d, i) => (
             <tr key={i}>
               <td>{d.label}</td>
               <td>₱{d.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
             </tr>
           ))}
-          <tr className="total-row">
-            <td>Total Deductions</td>
-            <td>₱{totalDeductions.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-          </tr>
         </tbody>
       </table>
 
