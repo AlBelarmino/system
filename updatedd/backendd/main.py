@@ -1175,7 +1175,7 @@ async def get_payslip(username: str, month: str, year: int):
 
         # 👔 Get employee profile
         cursor.execute("""
-            SELECT employment_type, base_salary_hour, base_monthly_salary
+            SELECT employment_type, base_salary_hour, base_monthly_salary, salary_grade
             FROM employee_profiles
             WHERE user_id = %s
         """, (user_id,))
@@ -1224,6 +1224,7 @@ async def get_payslip(username: str, month: str, year: int):
             "fullName": full_name,
             "period": parse_db_month_to_iso(normalized_month, normalized_year),
             "employmentType": employment_type,
+            "salaryGrade": profile.get("salary_grade") if profile else None,
             "ratePerHour": rate_per_hour,
             "ratePerMonth": rate_per_month,
             "totalHours": float(payslip.get("total_hours", 0)),
@@ -1484,3 +1485,60 @@ async def get_payslip_summary(data: MonthSelection):
             cursor.close()
             connection.close()
 
+@app.get("/api/records")
+async def get_user_records(username: str = Query(...)):
+    try:
+        connection = mysql.connector.connect(**db_config)
+        cursor = connection.cursor(dictionary=True)
+
+        # Get user ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_id = user["id"]
+
+        # Get payslip records
+        cursor.execute("""
+            SELECT 
+                p.month, 
+                p.year,
+                p.gross_income,
+                p.total_deductions,
+                p.net_income,
+                p.created_at
+            FROM payslips p
+            WHERE p.user_id = %s
+            ORDER BY p.year DESC, 
+                     STR_TO_DATE(CONCAT('01 ', p.month), '%%d %%M') DESC
+        """, (user_id,))
+        
+        payslips = cursor.fetchall()
+
+        # Format data
+        formatted = []
+        for row in payslips:
+            try:
+                date_obj = datetime.strptime(f"{row['month']} {row['year']}", "%B %Y")
+                formatted.append({
+                    "period": date_obj.strftime("%Y-%m"),
+                    "displayMonth": date_obj.strftime("%B %Y"),
+                    "gross_income": float(row["gross_income"]),
+                    "total_deductions": float(row["total_deductions"]),
+                    "net_income": float(row["net_income"]),
+                    "created_at": row["created_at"].strftime("%Y-%m-%d")
+                })
+            except Exception as e:
+                print(f"⚠️ Skip malformed record: {str(e)}")
+                continue
+
+        return formatted
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
