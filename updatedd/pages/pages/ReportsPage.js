@@ -2,6 +2,151 @@ import React, { useEffect, useState } from 'react';
 import axios from 'axios';
 import { Calendar, FileText, Download, Clock, DollarSign, TrendingUp, Building, Calculator, Eye, ChevronDown, ChevronUp } from 'lucide-react';
 
+
+const generatePayslipPDF = (payslipData, formatCurrency) => {
+  return `
+    <div style="padding: 20px; font-family: Arial, sans-serif;">
+      <!-- Header -->
+      <div style="text-align: center; margin-bottom: 20px;">
+        <h1 style="margin: 0;">${payslipData.fullName}</h1>
+        <p>${payslipData.period}</p>
+      </div>
+
+      <!-- Left Info Section -->
+      <div style="margin-bottom: 20px;">
+        <p><strong>Employment Type:</strong> ${payslipData.employmentType.charAt(0).toUpperCase() + payslipData.employmentType.slice(1)}</p>
+        ${payslipData.employmentType === "regular"
+        ? `<p><strong>Salary Grade:</strong> ${payslipData.salaryGrade || ''}</p>`
+        : ''}
+        ${
+          payslipData.employmentType === "regular"
+            ? `<p><strong>Worked Days:</strong> ${payslipData.daysPresent} / ${payslipData.workingDays}</p>`
+            : `<p><strong>Total Hours:</strong> ${payslipData.totalHours} hours</p>`
+        }
+      </div>
+
+      <!-- Earnings Table -->
+      <div style="margin-bottom: 20px;">
+        <h3 style="border-bottom: 1px solid #000;">Earnings</h3>
+        <table style="width: 100%;">
+          <tbody>
+            ${
+              payslipData.employmentType === "regular"
+                ? `<tr><td>Basic</td><td style="text-align: right;">${formatCurrency(payslipData.ratePerMonth)}</td></tr>`
+                : `<tr><td>Hourly Rate</td><td style="text-align: right;">${formatCurrency(payslipData.ratePerHour)}</td></tr>`
+            }
+            ${payslipData.bonuses?.map(bonus => (
+              `<tr><td>${bonus.label}</td><td style="text-align: right;">${formatCurrency(bonus.amount)}</td></tr>`
+            )).join('')}
+            <tr><td><strong>Total Earnings</strong></td><td style="text-align: right;"><strong>${formatCurrency(payslipData.grossIncome)}</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Deductions Table -->
+      <div style="margin-bottom: 20px;">
+        <h3 style="border-bottom: 1px solid #000;">Deductions</h3>
+        <table style="width: 100%;">
+          <tbody>
+            ${payslipData.deductions?.length > 0 ? (
+              payslipData.deductions.map(ded => (
+                `<tr><td>${ded.label}</td><td style="text-align: right;">${formatCurrency(ded.amount)}</td></tr>`
+              )).join('') + 
+              `<tr><td><strong>Total Deductions</strong></td><td style="text-align: right;"><strong>${formatCurrency(payslipData.deductions.reduce((sum, d) => sum + d.amount, 0))}</strong></td></tr>`
+            ) : `<tr><td>No deductions this period</td><td style="text-align: right;">-</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Net Pay -->
+      <div style="text-align: center; margin-bottom: 20px;">
+        <p style="font-size: 20px; font-weight: bold;">Net Pay: ${formatCurrency(payslipData.netPay)}</p>
+      </div>
+  `;
+};
+
+const generateSummaryPDF = (summaryData, formatCurrency) => {
+  const months = summaryData.months?.join(', ');
+  const monthlyRows = Object.entries(summaryData.monthlySummary)
+    .map(([period, data]) => `
+      <tr>
+        <td>${period.replace('-', ' ')}</td>
+        <td class="text-right">${formatCurrency(data.gross_income)}</td>
+        <td class="text-right">${formatCurrency(data.total_deductions)}</td>
+        <td class="text-right">${formatCurrency(data.net_income)}</td>
+      </tr>
+    `).join('');
+
+  const totalRow = `
+    <tr class="font-bold">
+      <td>TOTAL</td>
+      <td class="text-right">${formatCurrency(Object.values(summaryData.monthlySummary).reduce((sum, d) => sum + d.gross_income, 0))}</td>
+      <td class="text-right">${formatCurrency(Object.values(summaryData.monthlySummary).reduce((sum, d) => sum + d.total_deductions, 0))}</td>
+      <td class="text-right">${formatCurrency(Object.values(summaryData.monthlySummary).reduce((sum, d) => sum + d.net_income, 0))}</td>
+    </tr>`;
+
+  const incomeBreakdownRows = Object.entries(summaryData.incomeBreakdown)
+    .map(([incomeType, amounts]) => {
+      const row = Object.keys(summaryData.monthlySummary).map(month =>
+        `<td class="text-right">${amounts[month] ? formatCurrency(amounts[month]) : '-'}</td>`
+      ).join('');
+      const total = formatCurrency(Object.values(amounts).reduce((sum, a) => sum + a, 0));
+      return `<tr><td>${incomeType}</td>${row}<td class="text-right font-bold">${total}</td></tr>`;
+    }).join('');
+
+  const deductionBreakdownRows = Object.entries(summaryData.deductionBreakdown)
+    .filter(([key]) => !key.endsWith('_balance'))
+    .map(([deductionType, amounts]) => {
+      const balanceKey = `${deductionType}_balance`;
+      const lastMonth = summaryData.months?.slice(-1)[0] || '';
+      const balance = summaryData.deductionBreakdown[balanceKey]?.[lastMonth] || 0;
+      const row = Object.keys(summaryData.monthlySummary).map(month =>
+        `<td class="text-right">${amounts[month] ? formatCurrency(amounts[month]) : '-'}</td>`
+      ).join('');
+      const total = formatCurrency(Object.values(amounts).reduce((sum, a) => sum + a, 0));
+      return `<tr><td>${deductionType}</td>${row}<td class="text-right font-bold">${total}</td><td class="text-right">${formatCurrency(balance)}</td></tr>`;
+    }).join('');
+
+  return `
+    <div class="summary-report">
+      <div class="summary-header text-center mb-6">
+        <h1 class="text-2xl font-bold mb-1">Payroll Summary Report</h1>
+        <p class="text-lg">${summaryData.fullName}</p>
+        <p class="text-sm">${summaryData.employmentType.charAt(0).toUpperCase() + summaryData.employmentType.slice(1)} Employee | Grade ${summaryData.salaryGrade}</p>
+        <p class="text-sm mt-2">Period: ${months}</p>
+      </div>
+
+      <h2 class="text-lg font-bold mb-4 border-b border-black">Monthly Summary</h2>
+      <table>
+        <thead>
+          <tr><th>Period</th><th class="text-right">Income</th><th class="text-right">Deductions</th><th class="text-right">Net Pay</th></tr>
+        </thead>
+        <tbody>${monthlyRows}${totalRow}</tbody>
+      </table>
+
+      <h2 class="text-lg font-bold mb-4 border-b border-black page-break">Income Breakdown</h2>
+      <table>
+        <thead>
+          <tr><th>Income Type</th>${Object.keys(summaryData.monthlySummary).map(p => `<th class="text-right">${p.replace('-', ' ')}</th>`).join('')}<th class="text-right">Total</th></tr>
+        </thead>
+        <tbody>${incomeBreakdownRows}</tbody>
+      </table>
+
+      <h2 class="text-lg font-bold mb-4 border-b border-black">Deduction Breakdown</h2>
+      <table>
+        <thead>
+          <tr><th>Deduction Type</th>${Object.keys(summaryData.monthlySummary).map(p => `<th class="text-right">${p.replace('-', ' ')}</th>`).join('')}<th class="text-right">Total</th><th class="text-right">Current Balance</th></tr>
+        </thead>
+        <tbody>${deductionBreakdownRows}</tbody>
+      </table>
+
+      <div class="text-center mt-8 text-xs">
+        <p>This is a system generated payroll summary report</p>
+        <p>Generated on: ${new Date().toLocaleDateString()}</p>
+      </div>
+    </div>
+  `;
+};
 const ReportsPage = () => {
   const [payslip, setPayslip] = useState(null);
   const [summaryReport, setSummaryReport] = useState(null);
@@ -77,8 +222,47 @@ const ReportsPage = () => {
   }, [selectedMonths, username]);
 
   const handlePrint = () => {
-    window.print();
-  };
+  const printWindow = window.open('', '_blank');
+
+  let content;
+  if (selectedMonths.length === 1 && payslip) {
+    content = generatePayslipPDF(payslip, formatCurrency);
+  } else if (selectedMonths.length > 1 && summaryReport) {
+    content = generateSummaryPDF(summaryReport, formatCurrency);
+  } else {
+    printWindow.close();
+    return;
+  }
+
+  printWindow.document.write(`
+    <html>
+      <head>
+        <title>${selectedMonths.length === 1 ? 'Payslip' : 'Payroll Summary'} - ${summaryReport?.fullName || payslip?.fullName}</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+          table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+          th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+          th { background-color: #f2f2f2; font-weight: bold; }
+          .text-right { text-align: right; }
+          .text-center { text-align: center; }
+          .font-bold { font-weight: bold; }
+          .page-break { page-break-after: always; }
+          .summary-header { background-color: #f8f9fa; padding: 15px; margin-bottom: 20px; }
+        </style>
+      </head>
+      <body>
+        ${content}
+      </body>
+    </html>
+  `);
+
+  printWindow.document.close();
+  printWindow.focus();
+
+  setTimeout(() => {
+    printWindow.print();
+  }, 500);
+};
 
   const handleMonthSelection = (e, monthEntry) => {
     const monthKey = `${monthEntry.month}-${monthEntry.year}`;
