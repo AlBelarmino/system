@@ -1,3 +1,4 @@
+
 #computation of salary
 def clamp_time(actual_str, expected_str, direction="in"):
     actual = datetime.strptime(actual_str, "%H:%M").time()
@@ -265,7 +266,7 @@ async def compute_salary(payload: SalaryRequest):
         except Exception as e:
             print(f"Bonus processing failed: {str(e)}")
 
-        # 9. Final calculations - INCLUDE LATE DEDUCTION IN TOTAL DEDUCTIONS
+        # 9. Final calculations
         total_deductions = round(gsis + philhealth + tax + loan_deduction + late_deduction, 2)
         net = round(gross + bonuses - total_deductions, 2)
 
@@ -274,14 +275,14 @@ async def compute_salary(payload: SalaryRequest):
             INSERT INTO payslips (
                 user_id, dtr_id, month, year,
                 working_days, days_present, days_absent, leave_used,
-                total_hours, late_minutes, gross_income, bonuses,
+                total_hours, late_minutes, late_deduction, gross_income, bonuses,
                 philhealth_deduction, tax_deduction, loan_deduction,
                 total_deductions, net_income, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         """, (
             user_id, dtr["id"], dtr_month, dtr_year,
             working_days, days_present, days_absent, leave_used,
-            round(total_hours, 2), total_late_minutes, round(gross, 2), round(bonuses, 2),
+            round(total_hours, 2), total_late_minutes, late_deduction, round(gross, 2), round(bonuses, 2),
             philhealth, tax, round(loan_deduction, 2),
             total_deductions, net
         ))
@@ -520,4 +521,154 @@ async def get_payslip(username: str, month: str, year: int):
         if 'cursor' in locals():
             cursor.close()
         if 'connection' in locals():
+            connection.close()
+
+@app.post("/api/payslip/summary")
+async def get_payslip_summary(data: MonthSelection):
+    try:
+        connection = mysql.connector.connect(**db_config)
+        cursor = connection.cursor(dictionary=True)
+
+        # Get user ID and employment info
+        cursor.execute("""
+            SELECT u.id, e.employment_type, e.base_salary_hour, e.base_monthly_salary, e.salary_grade, u.full_name
+            FROM users u
+            LEFT JOIN employee_profiles e ON u.id = e.user_id
+            WHERE u.username = %s
+        """, (data.username,))
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_id = user["id"]
+        full_name = user["full_name"]
+
+        # Data containers
+        monthly_summary = {}
+        income_breakdown = defaultdict(lambda: defaultdict(float))
+        deduction_breakdown = defaultdict(lambda: defaultdict(float))
+        quarter_totals = defaultdict(float)
+        month_list = []
+
+        # Quarter label mapping
+        quarter_map = {
+            1: "Jan-Mar",
+            2: "Apr-Jun",
+            3: "Jul-Sep",
+            4: "Oct-Dec"
+        }
+
+        for entry in data.selected_months:
+            month = entry.month
+            year = entry.year
+
+            cursor.execute("""
+                SELECT *
+                FROM payslips
+                WHERE user_id = %s AND month = %s AND year = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (user_id, month, year))
+            payslip = cursor.fetchone()
+            if not payslip:
+                continue
+
+            payslip_id = payslip["id"]
+            month_key = f"{month} {year}"
+            month_list.append(month_key)
+
+            # Get quarter key for potential future use
+            try:
+                month_index = list(calendar.month_name).index(month.capitalize())
+                quarter = (month_index - 1) // 3 + 1
+                quarter_key = f"{quarter_map[quarter]} {year}"
+            except:
+                quarter_key = f"Q{month} {year}"
+
+            gross = float(payslip.get("gross_income", 0))
+            deductions = float(payslip.get("total_deductions", 0))
+            net = float(payslip.get("net_income", 0))
+
+            monthly_summary[month_key] = {
+                "gross_income": gross,
+                "total_deductions": deductions,
+                "net_income": net,
+                "quarter": quarter_key
+            }
+
+            quarter_totals[f"{quarter_key}_gross"] += gross
+            quarter_totals[f"{quarter_key}_deductions"] += deductions
+            quarter_totals[f"{quarter_key}_net"] += net
+
+            # Base salary
+            income_breakdown["Base Salary"][month_key] += gross
+
+            # Bonuses
+            cursor.execute("""
+                SELECT bonus_name, amount
+                FROM payslip_bonuses
+                WHERE payslip_id = %s
+            """, (payslip_id,))
+            for bonus in cursor.fetchall():
+                income_breakdown[bonus["bonus_name"]][month_key] += float(bonus["amount"])
+
+            # Loan deductions
+            cursor.execute("""
+                SELECT pl.loan_name, pl.amount,
+                       (SELECT balance FROM employee_loans 
+                        WHERE user_id = %s AND loan_name = pl.loan_name
+                        ORDER BY created_at DESC LIMIT 1) as balance
+                FROM payslip_loan_deductions pl
+                WHERE pl.payslip_id = %s
+            """, (user_id, payslip_id))
+            
+            for loan in cursor.fetchall():
+                deduction_breakdown[loan["loan_name"]][month_key] += float(loan["amount"])
+                deduction_breakdown[f"{loan['loan_name']}_balance"][month_key] = float(loan["balance"]) if loan["balance"] is not None else 0.0
+
+            # Gov deductions
+            gsis = float(payslip.get("total_deductions", 0)) - float(payslip.get("loan_deduction", 0)) - float(payslip.get("tax_deduction", 0)) - float(payslip.get("philhealth_deduction", 0))
+            philhealth = float(payslip.get("philhealth_deduction", 0))
+            tax = float(payslip.get("tax_deduction", 0))
+
+            deduction_breakdown["GSIS"][month_key] += gsis
+            deduction_breakdown["PhilHealth"][month_key] += philhealth
+            deduction_breakdown["Tax"][month_key] += tax
+
+        # Compute totals
+        total_gross = sum(month["gross_income"] for month in monthly_summary.values())
+        total_deductions = sum(month["total_deductions"] for month in monthly_summary.values())
+        total_net = sum(month["net_income"] for month in monthly_summary.values())
+
+        quarter_summary = {}
+        for quarter in set(m["quarter"] for m in monthly_summary.values()):
+            quarter_summary[quarter] = {
+                "gross_income": quarter_totals[f"{quarter}_gross"],
+                "total_deductions": quarter_totals[f"{quarter}_deductions"],
+                "net_income": quarter_totals[f"{quarter}_net"]
+            }
+
+        return {
+            "fullName": full_name,
+            "employmentType": user.get("employment_type", "regular"),
+            "salaryGrade": user.get("salary_grade", ""),
+            "monthlySummary": monthly_summary,
+            "quarterSummary": quarter_summary,  # still useful for charts
+            "incomeBreakdown": dict(income_breakdown),
+            "deductionBreakdown": dict(deduction_breakdown),
+            "totals": {
+                "gross_income": total_gross,
+                "total_deductions": total_deductions,
+                "net_income": total_net
+            },
+            "months": month_list
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        if 'connection' in locals() and connection.is_connected():
+            cursor.close()
             connection.close()
