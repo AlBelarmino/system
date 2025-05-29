@@ -1,4 +1,87 @@
+class PayrollProfile(BaseModel):
+    baseSalaryPerHour: float
+    sssDeduction: float
+    pagibigDeduction: float
+    philhealthDeduction: float
+    taxDeduction: float
+    employment_type: str = "regular"
+    leaveCredits: Optional[float] = 0.0 
+    bonuses: list
+    bonusOther: dict
+    loans: list
+    loanOther: dict
 
+class Loan(BaseModel):
+    name: str
+    amount: float
+    duration: int
+    start_month: str
+
+
+class UserProfile(BaseModel):
+    full_name: str
+    username: str
+    email: EmailStr
+    password: str = ""
+
+
+class LoginData(BaseModel):
+    username: str
+    password: str
+
+class DTRDayEntry(BaseModel):
+    day: int
+    am_arrival: str
+    am_departure: str
+    pm_arrival: str
+    pm_departure: str
+    undertime_hours: int
+    undertime_minutes: int
+
+class SalaryRequest(BaseModel):
+    username: str
+    month_str: str  
+
+
+class DeductionItem(BaseModel):
+    label: str
+    amount: float
+
+class PayslipResponse(BaseModel):
+    fullName: str
+    period: str
+    totalHours: float
+    ratePerHour: float
+    grossIncome: float
+    deductions: List[DeductionItem]
+
+class MonthEntry(BaseModel):
+    month: str
+    year: int
+
+class MonthSelection(BaseModel):
+    username: str
+    selected_months: List[MonthEntry]
+
+class RecordOut(BaseModel):
+    month: str
+    year: int
+    dtr_pdf_url: str
+    payslip_pdf_url: Optional[str]
+    payroll_report_pdf_url: Optional[str]
+
+    class Config:
+        orm_mode = True
+
+class InsightRequest(BaseModel):
+    payslip_data: dict
+    analysis_type: Optional[str] = "standard"
+    language: Optional[str] = "en"
+
+class InsightResponse(BaseModel):
+    insights: str
+    model: str
+    tokens_used: int
 #computation of salary
 def clamp_time(actual_str, expected_str, direction="in"):
     actual = datetime.strptime(actual_str, "%H:%M").time()
